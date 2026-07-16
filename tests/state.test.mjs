@@ -9,12 +9,14 @@ import assert from "node:assert/strict";
 import { makeTempDir } from "./helpers.mjs";
 import {
   loadState,
+  readJobFile,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
   saveState,
-  updateState
+  updateState,
+  writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
@@ -112,6 +114,19 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("readJobFile returns null on truncated json instead of throwing", () => {
+  const cwd = makeTempDir();
+  writeJobFile(cwd, "job-x", { id: "job-x", status: "running" });
+  const jobFile = resolveJobFile(cwd, "job-x");
+  fs.writeFileSync(jobFile, '{"id":"job-x","stat', "utf8"); // simulate crash mid-write
+  assert.equal(readJobFile(jobFile), null);
+});
+
+test("readJobFile returns null when file is missing", () => {
+  const cwd = makeTempDir();
+  assert.equal(readJobFile(resolveJobFile(cwd, "nope")), null);
 });
 
 // updateState is fully synchronous, so same-process Promise.all runs cycles
