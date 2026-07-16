@@ -11,6 +11,51 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const LOCK_DIR_NAME = "state.lock";
+const LOCK_STALE_MS = 10000;      // ponytail: coarse global lock/state-dir. writes tiny+rare.
+const LOCK_TIMEOUT_MS = 5000;     // upgrade: per-job locks if throughput ever matters.
+const LOCK_RETRY_MS = 25;
+
+function sleepSync(ms) {
+  // stdlib sync sleep (no dep) — lock retry runs in a sync code path.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireStateLock(cwd) {
+  const lockDir = path.join(resolveStateDir(cwd), LOCK_DIR_NAME);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir); // atomic: throws EEXIST if another writer holds it
+      return lockDir;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        const ageMs = Date.now() - fs.statSync(lockDir).mtimeMs;
+        if (ageMs > LOCK_STALE_MS) {
+          fs.rmSync(lockDir, { recursive: true, force: true }); // steal stale lock (crashed writer)
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between mkdir and stat — retry
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out acquiring Codex state lock at ${lockDir}`);
+      }
+      sleepSync(LOCK_RETRY_MS);
+    }
+  }
+}
+
+function releaseStateLock(lockDir) {
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // best-effort; stale-break covers a leaked lock
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -89,7 +134,7 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function persistState(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -111,14 +156,33 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  const target = resolveStateFile(cwd);
+  const tmp = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, target); // atomic replace on same filesystem
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  ensureStateDir(cwd);
+  const lockDir = acquireStateLock(cwd);
+  try {
+    return persistState(cwd, state);
+  } finally {
+    releaseStateLock(lockDir);
+  }
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  ensureStateDir(cwd);
+  const lockDir = acquireStateLock(cwd);
+  try {
+    const state = loadState(cwd);
+    mutate(state);
+    return persistState(cwd, state);
+  } finally {
+    releaseStateLock(lockDir);
+  }
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,7 +230,9 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  const tmp = `${jobFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, jobFile);
   return jobFile;
 }
 
