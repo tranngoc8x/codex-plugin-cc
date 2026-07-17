@@ -31,8 +31,8 @@ A worker that lacks information to proceed safely should stop and ask rather tha
 - When launching a `--write` worker, prepend this line to its prompt: `If you lack the information to proceed safely, output "NEEDS_INPUT: <your question>" as the very first line and stop — do not guess.`
 - After `result <jobId>`, if the output's first line is `NEEDS_INPUT:`, that worker is **escalated**, not done: it blocks its dependents until resolved.
 - Get the answer (ask the user if you don't have it), then resume that exact worker in its own worktree:
-  `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --cwd <worktreePath> --resume-last --write "<the answer>"`
-  Each worktree has its own Codex thread, so `--resume-last` there continues that worker, not another.
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --cwd <worktreePath> --thread <threadId> --write "<the answer>"`
+  The `<threadId>` is the `Codex session ID:` shown in that worker's result/status output (`threadId` in `--json`). `--thread` targets the worker's thread directly — the job index lives in the main repo, so a lookup from inside the worktree cannot find it.
 - Re-review the resumed worker's diff before merging, same as any wave result.
 
 ## Guardrails

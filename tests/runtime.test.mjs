@@ -504,6 +504,50 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
+test("task --thread resumes a specific thread without relying on the job index", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-a" }
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const threadId = JSON.parse(firstRun.stdout).threadId;
+  assert.ok(threadId, "first run should report its threadId");
+
+  // Different Claude session: --resume-last would not see sess-a's job index,
+  // but --thread targets the exact thread directly.
+  const result = run("node", [SCRIPT, "task", "--json", "--thread", threadId, "follow up"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-b" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.threadId, threadId, "must resume the requested thread, not start a new one");
+  assert.match(payload.rawOutput, /Resumed the prior run/);
+});
+
+test("task --thread conflicts with --resume-last and --fresh", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const conflict = run("node", [SCRIPT, "task", "--thread", "thr_x", "--resume-last", "hi"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(conflict.status, 0);
+  assert.match(conflict.stderr, /--thread/);
+});
+
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
