@@ -1003,6 +1003,81 @@ test("task --worktree runs Codex in an isolated worktree and records its path", 
   assert.equal(fs.realpathSync(fakeCodexState.threads[0].cwd), fs.realpathSync(worktreePath));
 });
 
+test("task --worktree --background runs the queued job inside the worktree", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--worktree", "--background", "--json", "investigate the failing test"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+  assert.match(launchPayload.jobId, /^task-/);
+
+  // Same mechanism the plain "task --background" test uses to drive the
+  // detached worker to completion: poll `status --wait` for the job.
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  const waitedPayload = JSON.parse(waitedStatus.stdout);
+  assert.equal(waitedPayload.job.id, launchPayload.jobId);
+  assert.equal(waitedPayload.job.status, "completed");
+
+  const worktreesDir = path.join(resolveStateDir(repo), "worktrees");
+  const entries = fs.readdirSync(worktreesDir);
+  assert.equal(entries.length, 1);
+  const worktreePath = path.join(worktreesDir, entries[0]);
+
+  // Confirm the worker actually launched Codex inside the worktree, not the
+  // original repo (git resolves symlinks, e.g. macOS /tmp -> /private/tmp,
+  // so compare realpaths).
+  const fakeCodexState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fs.realpathSync(fakeCodexState.threads[0].cwd), fs.realpathSync(worktreePath));
+});
+
+test("task --worktree --background removes the worktree if it fails before the job is persisted", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // No prompt, no --resume-last -> requireTaskRequest throws AFTER
+  // createTaskWorktree already created the worktree on disk.
+  const result = run("node", [SCRIPT, "task", "--worktree", "--background", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Provide a prompt/i);
+
+  const worktreesDir = path.join(resolveStateDir(repo), "worktrees");
+  const entries = fs.existsSync(worktreesDir) ? fs.readdirSync(worktreesDir) : [];
+  assert.deepEqual(entries, [], "no leftover worktree directory should remain");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

@@ -23,7 +23,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, createTaskWorktree, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, createTaskWorktree, ensureGitRepository, removeWorktree, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -799,25 +799,34 @@ async function handleTask(argv) {
   }
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    let payload;
+    try {
+      ensureCodexAvailable(cwd);
+      requireTaskRequest(prompt, resumeLast);
 
-    const request = buildTaskRequest({
-      cwd: runCwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      jobId: job.id
-    });
-    const jobWithWorktree = worktreePath ? { ...job, worktreePath } : job;
-    // NOTE: pass the original `cwd` here, not `runCwd` — this value becomes the
-    // spawned task-worker's own `--cwd`, which it re-resolves into its own
-    // workspaceRoot to look up the stored job. That must match job.workspaceRoot
-    // (the original repo), not the worktree, or the worker can't find its job.
-    // The worktree cwd still reaches Codex via `request.cwd` above.
-    const { payload } = enqueueBackgroundTask(cwd, jobWithWorktree, request);
+      const request = buildTaskRequest({
+        cwd: runCwd,
+        model,
+        effort,
+        prompt,
+        write,
+        resumeLast,
+        jobId: job.id
+      });
+      const jobWithWorktree = worktreePath ? { ...job, worktreePath } : job;
+      // NOTE: pass the original `cwd` here, not `runCwd` — this value becomes the
+      // spawned task-worker's own `--cwd`, which it re-resolves into its own
+      // workspaceRoot to look up the stored job. That must match job.workspaceRoot
+      // (the original repo), not the worktree, or the worker can't find its job.
+      // The worktree cwd still reaches Codex via `request.cwd` above.
+      ({ payload } = enqueueBackgroundTask(cwd, jobWithWorktree, request));
+    } catch (error) {
+      // ponytail: guards only the pre-persist window — once enqueueBackgroundTask
+      // writes the job record, session-end cleanup owns the worktree. No-ops
+      // when no worktree was created (removeWorktree is a no-op without a path).
+      removeWorktree(cwd, worktreePath);
+      throw error;
+    }
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
