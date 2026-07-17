@@ -3,8 +3,22 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import {
+  collectReviewContext,
+  createTaskWorktree,
+  removeWorktree,
+  resolveReviewTarget
+} from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+
+function initTempRepoWithCommit() {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  return cwd;
+}
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();
@@ -209,4 +223,26 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("createTaskWorktree checks out a detached worktree at the given path", () => {
+  const repo = initTempRepoWithCommit();
+  const wt = path.join(repo, ".wt", "job-1");
+
+  const result = createTaskWorktree(repo, wt, "HEAD");
+
+  assert.equal(result, wt);
+  assert.ok(fs.existsSync(path.join(wt, ".git")), "worktree should be a git checkout");
+  assert.ok(fs.existsSync(path.join(wt, "app.js")), "worktree should contain checked-out files");
+});
+
+test("removeWorktree tears a worktree down and is safe to call twice", () => {
+  const repo = initTempRepoWithCommit();
+  const wt = path.join(repo, ".wt", "job-2");
+  createTaskWorktree(repo, wt, "HEAD");
+
+  removeWorktree(repo, wt);
+
+  assert.ok(!fs.existsSync(wt), "worktree dir should be gone");
+  assert.doesNotThrow(() => removeWorktree(repo, wt));
 });

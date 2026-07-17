@@ -91,6 +91,24 @@ export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }
 
+export function createTaskWorktree(cwd, worktreePath, baseRef = "HEAD") {
+  const repoRoot = getRepoRoot(cwd);
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+  gitChecked(repoRoot, ["worktree", "add", "--detach", worktreePath, baseRef]);
+  return worktreePath;
+}
+
+export function removeWorktree(cwd, worktreePath) {
+  if (!worktreePath) {
+    return;
+  }
+  const repoRoot = getRepoRoot(cwd);
+  // Best-effort: --force removes even with local changes; prune clears any
+  // stale registration if the dir was already deleted by hand.
+  git(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+  git(repoRoot, ["worktree", "prune"]);
+}
+
 export function detectDefaultBranch(cwd) {
   const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
   if (symbolic.status === 0) {
