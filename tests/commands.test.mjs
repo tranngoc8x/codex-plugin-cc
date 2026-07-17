@@ -80,7 +80,8 @@ test("continue is not exposed as a user-facing command", () => {
     "review.md",
     "setup.md",
     "status.md",
-    "transfer.md"
+    "transfer.md",
+    "wait.md"
   ]);
 });
 
@@ -185,6 +186,13 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
+});
+
+test("wait command is a deterministic passthrough", () => {
+  const wait = read("commands/wait.md");
+  assert.match(wait, /disable-model-invocation:\s*true/);
+  assert.match(wait, /allowed-tools:\s*Bash\(node:\*\)/);
+  assert.match(wait, /codex-companion\.mjs" wait/);
 });
 
 test("internal docs use task terminology for rescue runs", () => {
