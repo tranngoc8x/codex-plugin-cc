@@ -243,4 +243,7 @@ test("codex-orchestration skill drives the real primitives, not a phantom subcom
   assert.match(doc, /review|diff/i);
   // must NOT invent an `orchestrate` subcommand — Claude is the coordinator
   assert.doesNotMatch(doc, /codex-companion\.mjs"?\s+orchestrate/);
+  // turn-boundary escalation convention
+  assert.match(doc, /NEEDS_INPUT/);
+  assert.match(doc, /--resume-last/);
 });

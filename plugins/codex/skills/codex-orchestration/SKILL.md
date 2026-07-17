@@ -26,6 +26,15 @@ You are the coordinator. Codex workers run as background `task` jobs, each isola
 6. **Advance the DAG.** Once a wave's results unlock dependents, launch the next wave (back to step 2).
 7. **On failure/escalation**, a worker returns `failed`; surface it and decide whether to retry (`--fresh`) or skip its dependents.
 
+## Escalation (a worker needs input)
+A worker that lacks information to proceed safely should stop and ask rather than guess.
+- When launching a `--write` worker, prepend this line to its prompt: `If you lack the information to proceed safely, output "NEEDS_INPUT: <your question>" as the very first line and stop — do not guess.`
+- After `result <jobId>`, if the output's first line is `NEEDS_INPUT:`, that worker is **escalated**, not done: it blocks its dependents until resolved.
+- Get the answer (ask the user if you don't have it), then resume that exact worker in its own worktree:
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --cwd <worktreePath> --resume-last --write "<the answer>"`
+  Each worktree has its own Codex thread, so `--resume-last` there continues that worker, not another.
+- Re-review the resumed worker's diff before merging, same as any wave result.
+
 ## Guardrails
 - Read-only subtasks: omit `--write`. Only pass `--write` when the subtask must edit code.
 - Never merge a worker's diff without showing it to the user first.
