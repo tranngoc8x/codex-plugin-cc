@@ -14,6 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { resolveStateFile, updateState } from "./lib/state.mjs";
+import { removeWorktree } from "./lib/git.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -52,10 +53,16 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   // Filter + persist happen inside the mutator so they run atomically under
   // the state lock — otherwise a concurrent upsertJob between load and save
-  // gets silently dropped by our stale-snapshot write.
+  // gets silently dropped by our stale-snapshot write. Worktree paths are
+  // collected here too, but the actual git subprocess runs after the lock
+  // is released (below) to keep git out of the state lock's critical section.
+  const worktreePaths = [];
   updateState(workspaceRoot, (state) => {
     const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
     for (const job of removedJobs) {
+      if (job.worktreePath) {
+        worktreePaths.push(job.worktreePath);
+      }
       const stillRunning = job.status === "queued" || job.status === "running";
       if (!stillRunning) {
         continue;
@@ -68,6 +75,14 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
     state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
+
+  for (const worktreePath of worktreePaths) {
+    try {
+      removeWorktree(workspaceRoot, worktreePath);
+    } catch {
+      // Best-effort: a leftover worktree is harmless; prune reclaims it later.
+    }
+  }
 }
 
 function handleSessionStart(input) {

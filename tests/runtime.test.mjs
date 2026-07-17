@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { listJobs, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+import { createTaskWorktree } from "../plugins/codex/scripts/lib/git.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -2142,6 +2143,41 @@ test("session end cleanup does not drop jobs upserted concurrently by another pr
   for (let index = 0; index < jobCount; index += 1) {
     assert.ok(ids.has(`job-b-${index}`), `missing job-b-${index}`);
   }
+});
+
+test("session end removes worktrees recorded on the session's jobs", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const worktreePath = path.join(resolveStateDir(repo), "worktrees", "job-wt");
+  createTaskWorktree(repo, worktreePath, "HEAD");
+  assert.ok(fs.existsSync(worktreePath), "worktree should exist before session end");
+
+  upsertJob(repo, {
+    id: "job-wt",
+    status: "completed",
+    sessionId: "sess-current",
+    worktreePath
+  });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!fs.existsSync(worktreePath), "worktree should be removed at session end");
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
