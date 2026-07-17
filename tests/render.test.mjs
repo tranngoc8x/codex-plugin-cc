@@ -58,6 +58,23 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /Resume in Codex: codex resume thr_123/);
 });
 
+test("renderStoredJobResult flags a NEEDS_INPUT escalation with a banner", () => {
+  const output = renderStoredJobResult(
+    { id: "task-1", status: "completed", title: "Codex Task", jobClass: "task", threadId: "thr_1" },
+    { threadId: "thr_1", result: { rawOutput: "NEEDS_INPUT: which database port?" } }
+  );
+  assert.match(output, /NEEDS INPUT: which database port\?/);
+  assert.match(output, /--resume-last/);
+});
+
+test("renderStoredJobResult does not add a banner for ordinary output", () => {
+  const output = renderStoredJobResult(
+    { id: "task-2", status: "completed", title: "Codex Task", jobClass: "task", threadId: "thr_2" },
+    { threadId: "thr_2", result: { rawOutput: "Done. Refactored the module." } }
+  );
+  assert.doesNotMatch(output, /NEEDS INPUT/);
+});
+
 test("job details surface the worktree path when present", () => {
   const output = renderJobStatusReport({
     id: "job-x",

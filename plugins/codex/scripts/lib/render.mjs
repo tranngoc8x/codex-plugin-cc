@@ -390,6 +390,17 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+// Turn-boundary escalation: a worker that stops with a leading
+// "NEEDS_INPUT: <question>" gets a banner so the coordinator spots it.
+function escalationBanner(rawOutput) {
+  const match = /^\s*NEEDS_INPUT:\s*(.*)/.exec(rawOutput || "");
+  if (!match) {
+    return "";
+  }
+  const question = match[1].trim();
+  return `> ⚠ NEEDS INPUT: ${question}\n> Answer, then resume this worker: task --cwd <worktreePath> --resume-last "<answer>"\n\n`;
+}
+
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
@@ -406,7 +417,8 @@ export function renderStoredJobResult(job, storedJob) {
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
   if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    const body = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    const output = `${escalationBanner(rawOutput)}${body}`;
     if (!threadId) {
       return output;
     }
