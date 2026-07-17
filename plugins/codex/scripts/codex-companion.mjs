@@ -84,7 +84,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
-      "  node scripts/codex-companion.mjs wait [--types <csv>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--json]"
+      "  node scripts/codex-companion.mjs wait [--types <csv>] [--jobs <csv>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--json]"
     ].join("\n")
   );
 }
@@ -916,7 +916,7 @@ function collectSnapshotJobs(snapshot) {
 
 async function handleWait(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "types"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "types", "jobs"],
     booleanOptions: ["json", "all"]
   });
 
@@ -927,13 +927,22 @@ async function handleWait(argv) {
       .map((value) => value.trim())
       .filter(Boolean)
   );
+  const jobIdFilter = options.jobs
+    ? new Set(
+        String(options.jobs)
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean)
+      )
+    : null;
   const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
 
   for (;;) {
     const snapshot = buildStatusSnapshot(cwd, { all: options.all });
-    const jobs = collectSnapshotJobs(snapshot);
+    const allJobs = collectSnapshotJobs(snapshot);
+    const jobs = jobIdFilter ? allJobs.filter((job) => jobIdFilter.has(job.id)) : allJobs;
     const matched = jobs.filter((job) => targetStatuses.has(job.status)).map((job) => job.id);
     if (matched.length > 0 || Date.now() >= deadline) {
       const payload = {
@@ -941,7 +950,11 @@ async function handleWait(argv) {
         matched,
         jobs
       };
-      outputCommandResult(payload, renderStatusPayload(snapshot, false), options.json);
+      const outcomeLine =
+        matched.length > 0
+          ? `Wait resolved — matched: ${matched.join(", ")}\n\n`
+          : `Wait timed out after ${timeoutMs}ms.\n\n`;
+      outputCommandResult(payload, `${outcomeLine}${renderStatusPayload(snapshot, false)}`, options.json);
       return;
     }
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));

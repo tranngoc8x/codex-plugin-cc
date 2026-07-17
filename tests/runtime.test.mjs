@@ -1923,6 +1923,118 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
+test("session end cleanup does not drop jobs upserted concurrently by another process", async () => {
+  // Regression test for the unlocked read-modify-write in cleanupSessionJobs:
+  // it used to loadState() outside the lock, then saveState() a filtered
+  // snapshot, silently dropping any job upserted by another process in
+  // between. It now runs filter+persist inside updateState()'s single lock
+  // window. Race genuinely by spawning both processes and awaiting together
+  // (not sequentially) so the OS interleaves them.
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-current",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            updatedAt: "2026-03-24T20:05:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const stateModulePath = path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs");
+  const upsertChildSource = `
+    import { pathToFileURL } from "node:url";
+    const { upsertJob } = await import(pathToFileURL(process.argv[2]).href);
+    const cwd = process.argv[3];
+    const count = Number(process.argv[4] || 10);
+    for (let index = 0; index < count; index += 1) {
+      upsertJob(cwd, {
+        id: \`job-b-\${index}\`,
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other"
+      });
+    }
+  `;
+  const childScript = path.join(repo, "upsert-child.mjs");
+  fs.writeFileSync(childScript, upsertChildSource, "utf8");
+
+  const jobCount = 30;
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+
+  function spawnAsync(command, args, options) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, options);
+      let stderr = "";
+      let stdin = options.input ?? null;
+      if (stdin != null) {
+        child.stdin.write(stdin);
+        child.stdin.end();
+      }
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          reject(new Error(`${command} ${args.join(" ")} exited with ${code}: ${stderr}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  // Launch both concurrently — the whole point is that neither waits for the
+  // other to fully finish before starting.
+  await Promise.all([
+    spawnAsync(process.execPath, [childScript, stateModulePath, repo, String(jobCount)], {
+      cwd: repo,
+      env
+    }),
+    spawnAsync(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        session_id: "sess-current",
+        cwd: repo
+      })
+    })
+  ]);
+
+  const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const ids = new Set(finalState.jobs.map((job) => job.id));
+  assert.equal(ids.has("task-current"), false, "session-current job should have been cleaned up");
+  for (let index = 0; index < jobCount; index += 1) {
+    assert.ok(ids.has(`job-b-${index}`), `missing job-b-${index}`);
+  }
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2324,4 +2436,56 @@ test("wait times out when no tracked job reaches a target status", () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.status, "timeout");
   assert.deepEqual(payload.matched, []);
+});
+
+test("wait text output states the outcome before the status render", () => {
+  const workspace = makeTempDir();
+  seedJobs(workspace, [
+    { id: "job-done", status: "completed", sessionId: WAIT_TEST_SESSION_ID },
+    { id: "job-run", status: "running", sessionId: WAIT_TEST_SESSION_ID }
+  ]);
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: WAIT_TEST_SESSION_ID
+  };
+  const resolved = run(
+    "node",
+    [SCRIPT, "wait", "--types", "completed,failed", "--timeout-ms", "1000"],
+    { cwd: workspace, env }
+  );
+  assert.equal(resolved.status, 0, resolved.stderr);
+  assert.match(resolved.stdout, /^Wait resolved — matched: job-done\n\n/);
+
+  const timedOut = run(
+    "node",
+    [SCRIPT, "wait", "--jobs", "job-run", "--types", "completed", "--timeout-ms", "300", "--poll-interval-ms", "100"],
+    { cwd: workspace, env }
+  );
+  assert.equal(timedOut.status, 0, timedOut.stderr);
+  assert.match(timedOut.stdout, /^Wait timed out after 300ms\.\n\n/);
+});
+
+test("wait --jobs scopes matching to the given ids and ignores stale terminal jobs", () => {
+  const workspace = makeTempDir();
+  seedJobs(workspace, [
+    { id: "job-old-done", status: "completed", sessionId: WAIT_TEST_SESSION_ID, updatedAt: "2020-01-01T00:00:00.000Z" },
+    { id: "job-run", status: "running", sessionId: WAIT_TEST_SESSION_ID, updatedAt: "2026-03-24T20:05:00.000Z" }
+  ]);
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: WAIT_TEST_SESSION_ID
+  };
+  const result = run(
+    "node",
+    [SCRIPT, "wait", "--jobs", "job-run", "--timeout-ms", "300", "--poll-interval-ms", "100", "--json"],
+    { cwd: workspace, env }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "timeout");
+  assert.deepEqual(payload.matched, []);
+  assert.deepEqual(payload.jobs.map((job) => job.id), ["job-run"]);
 });
