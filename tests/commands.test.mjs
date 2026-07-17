@@ -231,3 +231,16 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
 });
+
+test("codex-orchestration skill drives the real primitives, not a phantom subcommand", () => {
+  const doc = read("skills/codex-orchestration/SKILL.md");
+  assert.match(doc, /name:\s*codex-orchestration/);
+  assert.match(doc, /task --background --worktree/);
+  assert.match(doc, /wait --jobs/);
+  assert.match(doc, /\bresult\b/);
+  // coordinator loop must cap concurrency and review before merging
+  assert.match(doc, /--max-?concurrent|at most|concurrency/i);
+  assert.match(doc, /review|diff/i);
+  // must NOT invent an `orchestrate` subcommand — Claude is the coordinator
+  assert.doesNotMatch(doc, /codex-companion\.mjs"?\s+orchestrate/);
+});
