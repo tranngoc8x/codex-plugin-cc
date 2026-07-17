@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -56,4 +56,25 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
+});
+
+test("job details surface the worktree path when present", () => {
+  const output = renderJobStatusReport({
+    id: "job-x",
+    kind: "task",
+    status: "completed",
+    jobClass: "task",
+    worktreePath: "/tmp/state/worktrees/job-x"
+  });
+  assert.match(output, /Worktree: \/tmp\/state\/worktrees\/job-x/);
+});
+
+test("job details omit the worktree line when absent", () => {
+  const output = renderJobStatusReport({
+    id: "job-y",
+    kind: "task",
+    status: "completed",
+    jobClass: "task"
+  });
+  assert.doesNotMatch(output, /Worktree:/);
 });

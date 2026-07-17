@@ -145,6 +145,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
   }
+  if (job.worktreePath) {
+    lines.push(`  Worktree: ${job.worktreePath}`);
+  }
   if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
