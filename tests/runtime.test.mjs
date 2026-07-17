@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -967,6 +967,40 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task --worktree runs Codex in an isolated worktree and records its path", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "provider-no-auth");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--worktree", "--json", "do the thing"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+
+  const worktreesDir = path.join(resolveStateDir(repo), "worktrees");
+  assert.ok(fs.existsSync(worktreesDir), "a worktrees dir should exist under the state dir");
+  const entries = fs.readdirSync(worktreesDir);
+  assert.equal(entries.length, 1);
+  const worktreePath = path.join(worktreesDir, entries[0]);
+  assert.ok(fs.existsSync(path.join(worktreePath, ".git")), "worktree should be a real git checkout");
+
+  // The job record persisted to state.json should carry the worktree path.
+  const [job] = listJobs(repo);
+  assert.equal(job.worktreePath, worktreePath);
+
+  // The fake codex fixture records the cwd it was launched with per thread;
+  // confirm Codex actually ran inside the worktree, not the original repo.
+  // (git resolves symlinks, e.g. macOS /tmp -> /private/tmp, so compare realpaths.)
+  const fakeCodexState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fs.realpathSync(fakeCodexState.threads[0].cwd), fs.realpathSync(worktreePath));
 });
 
 test("review rejects focus text because it is native-review only", () => {

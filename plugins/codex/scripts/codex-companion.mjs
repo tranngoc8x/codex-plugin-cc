@@ -23,13 +23,14 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, createTaskWorktree, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveStateDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -79,7 +80,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--worktree] [--worktree-ref <ref>] [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -762,8 +763,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "worktree-ref"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "worktree"],
     aliasMap: {
       m: "model"
     }
@@ -786,13 +787,23 @@ async function handleTask(argv) {
     resumeLast
   });
 
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+
+  let runCwd = cwd;
+  let worktreePath = null;
+  if (options.worktree) {
+    const baseRef = options["worktree-ref"] || "HEAD";
+    worktreePath = path.join(resolveStateDir(workspaceRoot), "worktrees", job.id);
+    createTaskWorktree(cwd, worktreePath, baseRef);
+    runCwd = worktreePath;
+  }
+
   if (options.background) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
-      cwd,
+      cwd: runCwd,
       model,
       effort,
       prompt,
@@ -800,17 +811,23 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const jobWithWorktree = worktreePath ? { ...job, worktreePath } : job;
+    // NOTE: pass the original `cwd` here, not `runCwd` — this value becomes the
+    // spawned task-worker's own `--cwd`, which it re-resolves into its own
+    // workspaceRoot to look up the stored job. That must match job.workspaceRoot
+    // (the original repo), not the worktree, or the worker can't find its job.
+    // The worktree cwd still reaches Codex via `request.cwd` above.
+    const { payload } = enqueueBackgroundTask(cwd, jobWithWorktree, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const foregroundJob = worktreePath ? { ...job, worktreePath } : job;
   await runForegroundCommand(
-    job,
+    foregroundJob,
     (progress) =>
       executeTaskRun({
-        cwd,
+        cwd: runCwd,
         model,
         effort,
         prompt,
