@@ -83,7 +83,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs wait [--types <csv>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--json]"
     ].join("\n")
   );
 }
@@ -907,6 +908,46 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
+const DEFAULT_WAIT_TARGET_STATUSES = ["completed", "failed"];
+
+function collectSnapshotJobs(snapshot) {
+  return [...snapshot.running, ...(snapshot.latestFinished ? [snapshot.latestFinished] : []), ...snapshot.recent];
+}
+
+async function handleWait(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "types"],
+    booleanOptions: ["json", "all"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const targetStatuses = new Set(
+    String(options.types ?? DEFAULT_WAIT_TARGET_STATUSES.join(","))
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
+  const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const snapshot = buildStatusSnapshot(cwd, { all: options.all });
+    const jobs = collectSnapshotJobs(snapshot);
+    const matched = jobs.filter((job) => targetStatuses.has(job.status)).map((job) => job.id);
+    if (matched.length > 0 || Date.now() >= deadline) {
+      const payload = {
+        status: matched.length > 0 ? "resolved" : "timeout",
+        matched,
+        jobs
+      };
+      outputCommandResult(payload, renderStatusPayload(snapshot, false), options.json);
+      return;
+    }
+    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+  }
+}
+
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -1060,6 +1101,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "wait":
+      await handleWait(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

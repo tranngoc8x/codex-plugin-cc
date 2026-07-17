@@ -2257,3 +2257,71 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+function seedJobs(workspace, jobs) {
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: jobs.map((job) => ({
+          title: "Codex Job",
+          jobClass: "task",
+          updatedAt: "2026-03-24T20:05:00.000Z",
+          ...job
+        }))
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+}
+
+const WAIT_TEST_SESSION_ID = "sess-current";
+
+test("wait resolves immediately when a job already reached a terminal status", () => {
+  const workspace = makeTempDir();
+  seedJobs(workspace, [
+    { id: "job-done", status: "completed", sessionId: WAIT_TEST_SESSION_ID },
+    { id: "job-run", status: "running", sessionId: WAIT_TEST_SESSION_ID }
+  ]);
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: WAIT_TEST_SESSION_ID
+  };
+  const result = run(
+    "node",
+    [SCRIPT, "wait", "--json", "--types", "completed,failed", "--timeout-ms", "1000"],
+    { cwd: workspace, env }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "resolved");
+  assert.deepEqual(payload.matched, ["job-done"]);
+});
+
+test("wait times out when no tracked job reaches a target status", () => {
+  const workspace = makeTempDir();
+  seedJobs(workspace, [{ id: "job-run", status: "running", sessionId: WAIT_TEST_SESSION_ID }]);
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: WAIT_TEST_SESSION_ID
+  };
+  const result = run(
+    "node",
+    [SCRIPT, "wait", "--json", "--types", "completed", "--timeout-ms", "300", "--poll-interval-ms", "100"],
+    { cwd: workspace, env }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "timeout");
+  assert.deepEqual(payload.matched, []);
+});
