@@ -32,7 +32,7 @@ A worker that lacks information to proceed safely should stop and ask rather tha
 - After `result <jobId>`, if the output's first line is `NEEDS_INPUT:`, that worker is **escalated**, not done: it blocks its dependents until resolved.
 - Get the answer (ask the user if you don't have it), then resume that exact worker in its own worktree:
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --cwd <worktreePath> --thread <threadId> --write "<the answer>"`
-  The `<threadId>` is the `Codex session ID:` shown in that worker's result/status output (`threadId` in `--json`). `--thread` targets the worker's thread directly — the job index lives in the main repo, so a lookup from inside the worktree cannot find it.
+  The `<threadId>` is the `Codex session ID:` shown in that worker's result/status output (`threadId` in `--json`). `--thread` targets that worker's thread directly — with several workers in flight, a latest-thread lookup could resume the wrong one.
 - Re-review the resumed worker's diff before merging, same as any wave result.
 
 ## Guardrails

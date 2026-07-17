@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { getMainRepoRoot } from "./git.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -71,8 +72,19 @@ function defaultState() {
   };
 }
 
+// Jobs/state are keyed by the main repo root, so the job index is shared
+// between a repo and all its linked worktrees.
 export function resolveStateDir(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return stateDirForRoot(getMainRepoRoot(cwd) ?? resolveWorkspaceRoot(cwd));
+}
+
+// Runtime (broker/app-server) state stays keyed per worktree toplevel:
+// each worktree runs its own app-server so parallel workers don't contend.
+export function resolveRuntimeStateDir(cwd) {
+  return stateDirForRoot(resolveWorkspaceRoot(cwd));
+}
+
+function stateDirForRoot(workspaceRoot) {
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
     canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);

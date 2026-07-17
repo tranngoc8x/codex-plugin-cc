@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { listJobs, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveRuntimeStateDir, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { createTaskWorktree } from "../plugins/codex/scripts/lib/git.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -532,6 +532,40 @@ test("task --thread resumes a specific thread without relying on the job index",
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.threadId, threadId, "must resume the requested thread, not start a new one");
   assert.match(payload.rawOutput, /Resumed the prior run/);
+});
+
+test("job index is shared between the main repo and its worktrees", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const threadId = JSON.parse(firstRun.stdout).threadId;
+  assert.ok(threadId, "first run should report its threadId");
+
+  const worktree = path.join(makeTempDir(), "wt");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+
+  // The job index lives in one shared state dir keyed by the main repo,
+  // so a resume lookup works from inside a linked worktree too.
+  const result = run("node", [SCRIPT, "task", "--json", "--resume-last", "follow up"], {
+    cwd: worktree,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).threadId, threadId);
+
+  // But broker state stays per-worktree: each worktree keeps its own app-server.
+  assert.equal(resolveStateDir(worktree), resolveStateDir(repo));
+  assert.notEqual(resolveRuntimeStateDir(worktree), resolveRuntimeStateDir(repo));
 });
 
 test("task --thread conflicts with --resume-last and --fresh", () => {

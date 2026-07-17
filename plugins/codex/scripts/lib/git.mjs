@@ -91,6 +91,21 @@ export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }
 
+// Main repo root shared by a repo and all its linked worktrees, or null when
+// cwd is not a git repo (or a bare/submodule layout where the common dir is
+// not a plain `.git` directory).
+export function getMainRepoRoot(cwd) {
+  const result = git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (result.status !== 0) {
+    return null;
+  }
+  const commonDir = result.stdout.trim();
+  if (path.basename(commonDir) !== ".git") {
+    return null;
+  }
+  return path.dirname(commonDir);
+}
+
 export function createTaskWorktree(cwd, worktreePath, baseRef = "HEAD") {
   const repoRoot = getRepoRoot(cwd);
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });

@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveRuntimeStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -70,7 +70,7 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
 }
 
 function resolveBrokerStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
+  return path.join(resolveRuntimeStateDir(cwd), BROKER_STATE_FILE);
 }
 
 export function loadBrokerSession(cwd) {
@@ -87,7 +87,7 @@ export function loadBrokerSession(cwd) {
 }
 
 export function saveBrokerSession(cwd, session) {
-  const stateDir = resolveStateDir(cwd);
+  const stateDir = resolveRuntimeStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
 }
