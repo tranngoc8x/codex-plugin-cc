@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { cleanEnv, initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { listJobs, resolveRuntimeStateDir, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { createTaskWorktree } from "../plugins/codex/scripts/lib/git.mjs";
@@ -805,13 +805,14 @@ test("apply copies a worker worktree diff onto the main tree", () => {
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
+  const baseSha = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
 
   const worktree = path.join(makeTempDir(), "wt");
   run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
   // Worker output: one edit and one brand-new (untracked) file.
   fs.writeFileSync(path.join(worktree, "README.md"), "hello from worker\n");
   fs.writeFileSync(path.join(worktree, "notes.txt"), "new file\n");
-  seedFinishedWorktreeJob(repo, worktree);
+  seedFinishedWorktreeJob(repo, worktree, baseSha);
 
   const result = run("node", [SCRIPT, "apply", "task-wt", "--json"], {
     cwd: repo,
@@ -833,6 +834,7 @@ test("apply refuses a worker diff that does not apply cleanly", () => {
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
+  const baseSha = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
 
   const worktree = path.join(makeTempDir(), "wt");
   run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
@@ -840,7 +842,7 @@ test("apply refuses a worker diff that does not apply cleanly", () => {
   fs.writeFileSync(path.join(worktree, "notes.txt"), "new file\n");
   // Conflicting local edit in the main tree.
   fs.writeFileSync(path.join(repo, "README.md"), "diverged locally\n");
-  seedFinishedWorktreeJob(repo, worktree);
+  seedFinishedWorktreeJob(repo, worktree, baseSha);
 
   const result = run("node", [SCRIPT, "apply", "task-wt"], {
     cwd: repo,
@@ -883,6 +885,73 @@ test("apply still captures a worker's changes after the worker committed them", 
   assert.equal(payload.applied, true);
   assert.deepEqual(payload.files, ["notes.txt"]);
   assert.equal(fs.readFileSync(path.join(repo, "notes.txt"), "utf8"), "committed by worker\n");
+});
+
+test("apply refuses while a sibling job is still live in the same worktree", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const baseSha = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+
+  const worktree = path.join(makeTempDir(), "wt");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+  fs.writeFileSync(path.join(worktree, "notes.txt"), "in progress\n");
+  seedFinishedWorktreeJob(repo, worktree, baseSha);
+
+  // A resumer job (e.g. answering a NEEDS_INPUT escalation via --cwd
+  // <worktreePath> --thread <id>) is actively writing into the same
+  // worktree right now.
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs.push({
+    id: "task-wt-resumer",
+    status: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    threadId: "thr_wt",
+    worktreePath: worktree,
+    summary: "Resuming worker",
+    updatedAt: new Date().toISOString()
+  });
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const result = run("node", [SCRIPT, "apply", "task-wt"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is still running in this worktree/);
+});
+
+test("task --cwd into a worktree codex did not create is not tagged for cleanup", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // A plain linked worktree the user maintains for their own purposes —
+  // not one codex's --worktree flag created.
+  const worktree = path.join(makeTempDir(), "own-worktree");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--cwd", worktree, "--json", "hello"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const [job] = listJobs(repo);
+  assert.equal(
+    job.worktreePath,
+    undefined,
+    "a worktree codex did not create must never be tagged for session-end cleanup"
+  );
 });
 
 test("task --thread conflicts with --resume-last and --fresh", () => {
@@ -1751,7 +1820,8 @@ test("status shows phases, hints, and the latest finished job", () => {
   );
 
   const result = run("node", [SCRIPT, "status"], {
-    cwd: workspace
+    cwd: workspace,
+    env: cleanEnv()
   });
 
   assert.equal(result.status, 0, result.stderr);
@@ -1895,7 +1965,8 @@ test("status preserves adversarial review kind labels", () => {
   );
 
   const result = run("node", [SCRIPT, "status"], {
-    cwd: workspace
+    cwd: workspace,
+    env: cleanEnv()
   });
 
   assert.equal(result.status, 0, result.stderr);
@@ -2018,7 +2089,8 @@ test("result returns the stored output for the latest finished job by default", 
   );
 
   const result = run("node", [SCRIPT, "result"], {
-    cwd: workspace
+    cwd: workspace,
+    env: cleanEnv()
   });
 
   assert.equal(result.status, 0, result.stderr);

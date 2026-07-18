@@ -12,6 +12,18 @@ export function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
 }
 
+// Tests that seed jobs with no sessionId assume no active session filter.
+// Without this, an ambient CODEX_COMPANION_SESSION_ID (e.g. set by a Claude
+// Code session the suite happens to run inside) leaks in and hides those
+// jobs. CLAUDE_PLUGIN_DATA is left untouched: these tests derive their state
+// dir via resolveStateDir(workspace) in-process, and the spawned child must
+// see the same CLAUDE_PLUGIN_DATA to resolve to the same directory.
+export function cleanEnv() {
+  const env = { ...process.env };
+  delete env.CODEX_COMPANION_SESSION_ID;
+  return env;
+}
+
 export function run(command, args, options = {}) {
   return spawnSync(command, args, {
     cwd: options.cwd,

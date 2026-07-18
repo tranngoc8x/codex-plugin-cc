@@ -848,13 +848,35 @@ async function handleTask(argv) {
     // still captured (HEAD would have moved past them by then).
     worktreeBase = resolveCommitSha(cwd, baseRef);
   } else {
-    // Not creating a worktree, but --cwd may still point INTO an existing one
-    // (e.g. resuming an escalated worker via --cwd <worktreePath> --thread
-    // <id>). Tag it on this job's record too, so session-end cleanup knows
-    // the worktree is still in use even though this job didn't create it.
+    // Not creating a worktree, but --cwd may still point INTO one CODEX
+    // created (e.g. resuming an escalated worker via --cwd <worktreePath>
+    // --thread <id>). Tag it on this job's record too, so session-end
+    // cleanup knows the worktree is still in use even though this job
+    // didn't create it. Only tag worktrees codex itself created (under
+    // <stateDir>/worktrees/) — a plain linked worktree the user maintains
+    // for their own purposes must never be tagged, since session-end
+    // cleanup force-removes tagged worktrees once no job still claims them.
     const mainRoot = getMainRepoRoot(workspaceRoot);
     if (mainRoot && mainRoot !== workspaceRoot) {
-      worktreePath = workspaceRoot;
+      // realpath both sides — git resolves symlinks (e.g. macOS /tmp ->
+      // /private/tmp) in workspaceRoot, so a raw string prefix check would
+      // false-negative on a worktree codex did create.
+      const worktreesDir = path.join(resolveStateDir(workspaceRoot), "worktrees");
+      let realWorktreesDir;
+      let realWorkspaceRoot;
+      try {
+        realWorktreesDir = fs.realpathSync(worktreesDir);
+      } catch {
+        realWorktreesDir = worktreesDir;
+      }
+      try {
+        realWorkspaceRoot = fs.realpathSync(workspaceRoot);
+      } catch {
+        realWorkspaceRoot = workspaceRoot;
+      }
+      if ((realWorkspaceRoot + path.sep).startsWith(realWorktreesDir + path.sep)) {
+        worktreePath = workspaceRoot;
+      }
     }
   }
 
@@ -1072,7 +1094,7 @@ function handleResult(argv) {
 
 function handleApply(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "base"],
     booleanOptions: ["json"]
   });
 
@@ -1090,14 +1112,39 @@ function handleApply(argv) {
     throw new Error(`Worktree for ${job.id} is gone (${worktreePath}). Nothing to apply.`);
   }
 
+  // A sibling job (e.g. a resumer answering a NEEDS_INPUT escalation via
+  // --cwd <worktreePath> --thread <id>) may be actively writing into this
+  // same worktree right now. Diffing mid-write would capture a torn snapshot
+  // and force it onto the main tree, so refuse until nothing live still owns it.
+  const liveSibling = listJobs(workspaceRoot).find(
+    (candidate) =>
+      candidate.id !== job.id &&
+      candidate.worktreePath === worktreePath &&
+      (candidate.status === "queued" || candidate.status === "running")
+  );
+  if (liveSibling) {
+    throw new Error(
+      `Job ${liveSibling.id} is still ${liveSibling.status} in this worktree (${worktreePath}). Wait for it to finish before applying.`
+    );
+  }
+
   // worktreeBase lives on whichever job CREATED the worktree — if the caller
   // asked to apply a job that only resumed into it (no --worktree flag), fall
-  // back to a sibling job sharing the same worktreePath.
+  // back to a sibling job sharing the same worktreePath. If neither has it
+  // (the creator's record was evicted from the job index), refuse rather than
+  // silently diffing against the worktree's own HEAD — which, once a worker
+  // has committed, no longer reflects the original base and would apply an
+  // empty diff without any indication changes were lost.
   const worktreeBase =
-    job.worktreeBase ??
+    options.base ||
+    job.worktreeBase ||
     listJobs(workspaceRoot).find((candidate) => candidate.worktreePath === worktreePath && candidate.worktreeBase)
-      ?.worktreeBase ??
-    "HEAD";
+      ?.worktreeBase;
+  if (!worktreeBase) {
+    throw new Error(
+      `Cannot determine the original base commit for ${job.id}'s worktree (${worktreePath}) — its creator job record is gone. Pass it explicitly with --base <ref>.`
+    );
+  }
   const { applied, files } = applyWorktreeDiff(cwd, worktreePath, worktreeBase);
   const payload = { jobId: job.id, worktreePath, applied, files };
   const rendered = applied
