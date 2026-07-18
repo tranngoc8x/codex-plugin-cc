@@ -35,7 +35,9 @@ export function parseArgs(argv, config = {}) {
 
       if (valueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
-        if (nextValue === undefined) {
+        // A next token that is itself a flag means the value was forgotten
+        // (bare "-" and explicit --key=-x stay allowed).
+        if (nextValue === undefined || (inlineValue === undefined && nextValue.startsWith("-") && nextValue !== "-")) {
           throw new Error(`Missing value for --${rawKey}`);
         }
         options[key] = nextValue;
@@ -59,7 +61,7 @@ export function parseArgs(argv, config = {}) {
 
     if (valueOptions.has(key)) {
       const nextValue = argv[index + 1];
-      if (nextValue === undefined) {
+      if (nextValue === undefined || (nextValue.startsWith("-") && nextValue !== "-")) {
         throw new Error(`Missing value for -${shortKey}`);
       }
       options[key] = nextValue;

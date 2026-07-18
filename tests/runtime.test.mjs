@@ -532,6 +532,53 @@ test("task --thread resumes a specific thread without relying on the job index",
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.threadId, threadId, "must resume the requested thread, not start a new one");
   assert.match(payload.rawOutput, /Resumed the prior run/);
+
+  // A --thread run is a resume, so it gets the resume label like --resume-last.
+  const titles = listJobs(repo).map((job) => job.title);
+  assert.ok(titles.includes("Codex Resume"), `expected a "Codex Resume" job, got: ${titles.join(", ")}`);
+});
+
+test("task --thread refuses a thread that a running job still owns", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-busy",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-other",
+            threadId: "thr_busy",
+            summary: "Worker still running",
+            updatedAt: "2026-03-24T20:05:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  // Unlike --resume-last, the guard must hold across Claude sessions:
+  // a busy thread is busy no matter who asks.
+  const result = run("node", [SCRIPT, "task", "--thread", "thr_busy", "follow up"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" }
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /task-busy is still running/);
 });
 
 test("job index is shared between the main repo and its worktrees", () => {
@@ -580,6 +627,30 @@ test("task --thread conflicts with --resume-last and --fresh", () => {
   });
   assert.notEqual(conflict.status, 0);
   assert.match(conflict.stderr, /--thread/);
+
+  const resumeFresh = run("node", [SCRIPT, "task", "--resume-last", "--fresh", "hi"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(resumeFresh.status, 0);
+  assert.match(resumeFresh.stderr, /--resume/);
+  assert.match(resumeFresh.stderr, /--fresh/);
+});
+
+test("task --thread rejects a flag token in place of a thread id", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  // `--thread --fresh` means the user forgot the id; the parser must not
+  // swallow the next flag as the value and silently resume thread "--fresh".
+  const result = run("node", [SCRIPT, "task", "--thread", "--fresh", "hi"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Missing value for --thread/);
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {

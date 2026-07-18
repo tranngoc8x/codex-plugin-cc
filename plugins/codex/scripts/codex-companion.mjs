@@ -466,10 +466,20 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: request.resumeLast,
+    threadId: request.threadId
   });
 
   let resumeThreadId = request.threadId ?? null;
+  if (resumeThreadId) {
+    // Unlike --resume-last, no session filter: a busy thread is busy for everyone.
+    const busyJob = listJobs(workspaceRoot).find(
+      (job) => job.id !== request.jobId && job.threadId === resumeThreadId && (job.status === "queued" || job.status === "running")
+    );
+    if (busyJob) {
+      throw new Error(`Task ${busyJob.id} is still running on this thread. Use /codex:status before continuing it.`);
+    }
+  }
   if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
@@ -539,16 +549,17 @@ function buildReviewJobMetadata(reviewName, target) {
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
-  if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, threadId = null }) {
+  const resume = resumeLast || Boolean(threadId);
+  if (!resume && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
       title: "Codex Stop Gate Review",
       summary: "Stop-gate review of previous Claude turn"
     };
   }
 
-  const title = resumeLast ? "Codex Resume" : "Codex Task";
-  const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
+  const title = resume ? "Codex Resume" : "Codex Task";
+  const fallbackSummary = resume ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
     summary: shorten(prompt || fallbackSummary)
@@ -780,16 +791,14 @@ async function handleTask(argv) {
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   const threadId = options.thread || null;
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
-  }
-  if (threadId && (resumeLast || fresh)) {
-    throw new Error("Choose either --thread, --resume/--resume-last, or --fresh.");
+  if ([resumeLast, fresh, Boolean(threadId)].filter(Boolean).length > 1) {
+    throw new Error("Choose only one of --thread, --resume/--resume-last, or --fresh.");
   }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast,
+    threadId
   });
 
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
