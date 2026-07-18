@@ -22,7 +22,7 @@ You are the coordinator. Codex workers run as background `task` jobs, each isola
 4. **Collect + review** each finished worker:
    - `... result <jobId>` for Codex's summary.
    - The result/status output includes a `Worktree:` path. Inspect the real changes with `git -C <worktreePath> diff HEAD`. Review before trusting.
-5. **Merge deliberately.** Never auto-apply. Show each worker's diff to the user; apply to the main tree only after review, resolving conflicts between workers yourself.
+5. **Merge deliberately.** Never auto-apply. Show each worker's diff to the user; apply to the main tree only after review. Once a diff is approved, `... apply <jobId>` copies it onto the main tree in one step (it refuses on conflict — then merge manually, resolving conflicts between workers yourself).
 6. **Advance the DAG.** Once a wave's results unlock dependents, launch the next wave (back to step 2).
 7. **On failure/escalation**, a worker returns `failed`; surface it and decide whether to retry (`--fresh`) or skip its dependents.
 

@@ -124,6 +124,31 @@ export function removeWorktree(cwd, worktreePath) {
   git(repoRoot, ["worktree", "prune"]);
 }
 
+// Copy a worker worktree's uncommitted changes onto the main working tree.
+// All-or-nothing: `git apply --check` runs first, so a conflicting patch
+// changes nothing and the coordinator merges manually instead.
+export function applyWorktreeDiff(cwd, worktreePath) {
+  const repoRoot = getRepoRoot(cwd);
+  // Track brand-new files so the diff includes them (content stays unstaged).
+  gitChecked(worktreePath, ["add", "--intent-to-add", "--all"]);
+  const diffArgs = ["diff", "--binary", "--no-ext-diff", "HEAD"];
+  const diff = gitChecked(worktreePath, diffArgs, { maxBuffer: 64 * 1024 * 1024 }).stdout;
+  if (!diff.trim()) {
+    return { applied: false, files: [] };
+  }
+  const files = gitChecked(worktreePath, ["diff", "--name-only", "HEAD"]).stdout.trim().split("\n").filter(Boolean);
+
+  const check = git(repoRoot, ["apply", "--check", "--binary"], { input: diff });
+  if (check.status !== 0) {
+    const detail = (check.stderr || "").trim() || "conflicting local changes";
+    throw new Error(
+      `Worker diff does not apply cleanly: ${detail}. Review it with git -C ${worktreePath} diff HEAD and merge manually.`
+    );
+  }
+  gitChecked(repoRoot, ["apply", "--binary"], { input: diff });
+  return { applied: true, files };
+}
+
 export function detectDefaultBranch(cwd) {
   const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
   if (symbolic.status === 0) {

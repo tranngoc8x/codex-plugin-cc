@@ -23,7 +23,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, createTaskWorktree, ensureGitRepository, removeWorktree, resolveReviewTarget } from "./lib/git.mjs";
+import { applyWorktreeDiff, collectReviewContext, createTaskWorktree, ensureGitRepository, removeWorktree, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -84,6 +84,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs apply [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "  node scripts/codex-companion.mjs wait [--types <csv>] [--jobs <csv>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--json]"
     ].join("\n")
@@ -1021,6 +1022,32 @@ function handleResult(argv) {
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
 }
 
+function handleApply(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  const storedJob = readStoredJob(workspaceRoot, job.id) ?? {};
+  const worktreePath = job.worktreePath ?? storedJob.worktreePath ?? null;
+  if (!worktreePath) {
+    throw new Error(`Job ${job.id} has no worktree — it ran directly in the main tree, nothing to apply.`);
+  }
+  if (!fs.existsSync(worktreePath)) {
+    throw new Error(`Worktree for ${job.id} is gone (${worktreePath}). Nothing to apply.`);
+  }
+
+  const { applied, files } = applyWorktreeDiff(cwd, worktreePath);
+  const payload = { jobId: job.id, worktreePath, applied, files };
+  const rendered = applied
+    ? `Applied ${files.length} file(s) from ${job.id}:\n${files.map((file) => `  ${file}`).join("\n")}\n`
+    : `Worktree for ${job.id} has no changes to apply.\n`;
+  outputCommandResult(payload, rendered, options.json);
+}
+
 function handleTaskResumeCandidate(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -1150,6 +1177,9 @@ async function main() {
       break;
     case "result":
       handleResult(argv);
+      break;
+    case "apply":
+      handleApply(argv);
       break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);

@@ -64,7 +64,9 @@ test("renderStoredJobResult flags a NEEDS_INPUT escalation with a banner", () =>
     { threadId: "thr_1", result: { rawOutput: "NEEDS_INPUT: which database port?" } }
   );
   assert.match(output, /NEEDS INPUT: which database port\?/);
-  assert.match(output, /--resume-last/);
+  // The banner must teach the working resume flow: --thread with the real id.
+  assert.match(output, /--thread thr_1/);
+  assert.doesNotMatch(output, /--resume-last/);
 });
 
 test("renderStoredJobResult does not add a banner for ordinary output", () => {

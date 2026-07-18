@@ -243,9 +243,11 @@ test("codex-orchestration skill drives the real primitives, not a phantom subcom
   assert.match(doc, /review|diff/i);
   // must NOT invent an `orchestrate` subcommand — Claude is the coordinator
   assert.doesNotMatch(doc, /codex-companion\.mjs"?\s+orchestrate/);
-  // turn-boundary escalation convention: resume by thread id — a worktree has no
-  // job index of its own, so --resume-last cannot find the worker's thread there
+  // turn-boundary escalation convention: resume by thread id — with several
+  // workers in flight, a latest-thread lookup could resume the wrong one
   assert.match(doc, /NEEDS_INPUT/);
   assert.match(doc, /--thread <threadId>/);
   assert.doesNotMatch(doc, /--resume-last/);
+  // merge step teaches the apply helper for clean diffs
+  assert.match(doc, /apply <jobId>/);
 });

@@ -615,6 +615,91 @@ test("job index is shared between the main repo and its worktrees", () => {
   assert.notEqual(resolveRuntimeStateDir(worktree), resolveRuntimeStateDir(repo));
 });
 
+function seedFinishedWorktreeJob(repo, worktreePath) {
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-wt",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            threadId: "thr_wt",
+            worktreePath,
+            summary: "Worker finished",
+            updatedAt: "2026-03-24T20:05:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+}
+
+test("apply copies a worker worktree diff onto the main tree", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const worktree = path.join(makeTempDir(), "wt");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+  // Worker output: one edit and one brand-new (untracked) file.
+  fs.writeFileSync(path.join(worktree, "README.md"), "hello from worker\n");
+  fs.writeFileSync(path.join(worktree, "notes.txt"), "new file\n");
+  seedFinishedWorktreeJob(repo, worktree);
+
+  const result = run("node", [SCRIPT, "apply", "task-wt", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.applied, true);
+  assert.deepEqual(payload.files.sort(), ["README.md", "notes.txt"]);
+  assert.equal(fs.readFileSync(path.join(repo, "README.md"), "utf8"), "hello from worker\n");
+  assert.equal(fs.readFileSync(path.join(repo, "notes.txt"), "utf8"), "new file\n");
+});
+
+test("apply refuses a worker diff that does not apply cleanly", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const worktree = path.join(makeTempDir(), "wt");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+  fs.writeFileSync(path.join(worktree, "README.md"), "worker version\n");
+  fs.writeFileSync(path.join(worktree, "notes.txt"), "new file\n");
+  // Conflicting local edit in the main tree.
+  fs.writeFileSync(path.join(repo, "README.md"), "diverged locally\n");
+  seedFinishedWorktreeJob(repo, worktree);
+
+  const result = run("node", [SCRIPT, "apply", "task-wt"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not apply cleanly/);
+  // All-or-nothing: the conflicting patch must not half-land.
+  assert.equal(fs.readFileSync(path.join(repo, "README.md"), "utf8"), "diverged locally\n");
+  assert.ok(!fs.existsSync(path.join(repo, "notes.txt")));
+});
+
 test("task --thread conflicts with --resume-last and --fresh", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
