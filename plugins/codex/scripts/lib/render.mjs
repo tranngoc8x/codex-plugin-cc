@@ -390,15 +390,30 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-// Turn-boundary escalation: a worker that stops with a leading
-// "NEEDS_INPUT: <question>" gets a banner so the coordinator spots it.
-function escalationBanner(rawOutput, threadId = null) {
+// Turn-boundary escalation convention: a worker that lacks the information to
+// proceed safely stops with a leading "NEEDS_INPUT: <question>" instead of
+// guessing. Shared by the render-time banner and the structured flag stamped
+// onto the job record at store time (tracked-jobs.mjs) so JSON consumers
+// (wait --json, result --json) don't have to re-implement this regex.
+export function extractRawOutput(result) {
+  return (
+    (typeof result?.rawOutput === "string" && result.rawOutput) ||
+    (typeof result?.codex?.stdout === "string" && result.codex.stdout) ||
+    ""
+  );
+}
+
+export function isEscalatedRawOutput(rawOutput) {
+  return /^\s*NEEDS_INPUT:/.test(rawOutput || "");
+}
+
+function escalationBanner(rawOutput, threadId = null, worktreePath = null) {
   const match = /^\s*NEEDS_INPUT:\s*(.*)/.exec(rawOutput || "");
   if (!match) {
     return "";
   }
   const question = match[1].trim();
-  return `> ⚠ NEEDS INPUT: ${question}\n> Answer, then resume this worker: task --cwd <worktreePath> --thread ${threadId ?? "<threadId>"} --write "<answer>"\n\n`;
+  return `> ⚠ NEEDS INPUT: ${question}\n> Answer, then resume this worker: task --cwd ${worktreePath ?? "<worktreePath>"} --thread ${threadId ?? "<threadId>"} --write "<answer>"\n\n`;
 }
 
 export function renderStoredJobResult(job, storedJob) {
@@ -412,13 +427,10 @@ export function renderStoredJobResult(job, storedJob) {
     return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
   }
 
-  const rawOutput =
-    (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
-    "";
+  const rawOutput = extractRawOutput(storedJob?.result);
   if (rawOutput) {
     const body = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    const output = `${escalationBanner(rawOutput, threadId)}${body}`;
+    const output = `${escalationBanner(rawOutput, threadId, job.worktreePath ?? null)}${body}`;
     if (!threadId) {
       return output;
     }

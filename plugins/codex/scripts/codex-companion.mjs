@@ -23,7 +23,16 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { applyWorktreeDiff, collectReviewContext, createTaskWorktree, ensureGitRepository, removeWorktree, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  applyWorktreeDiff,
+  collectReviewContext,
+  createTaskWorktree,
+  ensureGitRepository,
+  getMainRepoRoot,
+  removeWorktree,
+  resolveCommitSha,
+  resolveReviewTarget
+} from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -32,6 +41,7 @@ import {
   listJobs,
   resolveStateDir,
   setConfig,
+  updateState,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -341,11 +351,11 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
-  if (activeTask) {
-    throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
-  }
 
+  // Busy-ness is checked once, per-thread, by claimResumeThread below — not
+  // here. A coarse "any task running in this session" block would false-block
+  // a fan-out sibling on an unrelated thread (a shared job index now makes
+  // siblings visible across worktrees).
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
     return { id: trackedTask.threadId };
@@ -461,6 +471,25 @@ async function executeReviewRun(request) {
 }
 
 
+// Check-and-claim a resume thread under the shared state lock so the busy
+// check and the threadId stamp are one atomic step, not check-then-act: a
+// second resume racing this one during worker startup (before any progress
+// event would otherwise stamp threadId) sees the claim already made.
+function claimResumeThread(workspaceRoot, jobId, threadId) {
+  updateState(workspaceRoot, (state) => {
+    const busyJob = state.jobs.find(
+      (job) => job.id !== jobId && job.threadId === threadId && (job.status === "queued" || job.status === "running")
+    );
+    if (busyJob) {
+      throw new Error(`Task ${busyJob.id} is still running on this thread. Use /codex:status before continuing it.`);
+    }
+    const jobRecord = state.jobs.find((job) => job.id === jobId);
+    if (jobRecord) {
+      jobRecord.threadId = threadId;
+    }
+  });
+}
+
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
@@ -472,15 +501,6 @@ async function executeTaskRun(request) {
   });
 
   let resumeThreadId = request.threadId ?? null;
-  if (resumeThreadId) {
-    // Unlike --resume-last, no session filter: a busy thread is busy for everyone.
-    const busyJob = listJobs(workspaceRoot).find(
-      (job) => job.id !== request.jobId && job.threadId === resumeThreadId && (job.status === "queued" || job.status === "running")
-    );
-    if (busyJob) {
-      throw new Error(`Task ${busyJob.id} is still running on this thread. Use /codex:status before continuing it.`);
-    }
-  }
   if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
@@ -489,6 +509,15 @@ async function executeTaskRun(request) {
       throw new Error("No previous Codex task thread was found for this repository.");
     }
     resumeThreadId = latestThread.id;
+  }
+
+  if (resumeThreadId) {
+    // Unlike session-scoped resume lookups, no session filter here: a busy
+    // thread is busy for everyone, whether reached via --thread or
+    // --resume-last. Claim happens under the state lock so the check and the
+    // stamp are one atomic step — a second resume racing this one during
+    // startup sees the claim, not a still-empty threadId.
+    claimResumeThread(workspaceRoot, request.jobId, resumeThreadId);
   }
 
   if (!request.prompt && !resumeThreadId) {
@@ -806,11 +835,27 @@ async function handleTask(argv) {
 
   let runCwd = cwd;
   let worktreePath = null;
+  let worktreeBase = null;
+  let createdWorktreePath = null;
   if (options.worktree) {
     const baseRef = options["worktree-ref"] || "HEAD";
     worktreePath = path.join(resolveStateDir(workspaceRoot), "worktrees", job.id);
     createTaskWorktree(cwd, worktreePath, baseRef);
+    createdWorktreePath = worktreePath;
     runCwd = worktreePath;
+    // Record the exact commit the worktree was detached at — apply diffs
+    // against this, not HEAD, so a worker that commits its own changes is
+    // still captured (HEAD would have moved past them by then).
+    worktreeBase = resolveCommitSha(cwd, baseRef);
+  } else {
+    // Not creating a worktree, but --cwd may still point INTO an existing one
+    // (e.g. resuming an escalated worker via --cwd <worktreePath> --thread
+    // <id>). Tag it on this job's record too, so session-end cleanup knows
+    // the worktree is still in use even though this job didn't create it.
+    const mainRoot = getMainRepoRoot(workspaceRoot);
+    if (mainRoot && mainRoot !== workspaceRoot) {
+      worktreePath = workspaceRoot;
+    }
   }
 
   if (options.background) {
@@ -829,7 +874,7 @@ async function handleTask(argv) {
         threadId,
         jobId: job.id
       });
-      const jobWithWorktree = worktreePath ? { ...job, worktreePath } : job;
+      const jobWithWorktree = worktreePath ? { ...job, worktreePath, ...(worktreeBase ? { worktreeBase } : {}) } : job;
       // NOTE: pass the original `cwd` here, not `runCwd` — this value becomes the
       // spawned task-worker's own `--cwd`, which it re-resolves into its own
       // workspaceRoot to look up the stored job. That must match job.workspaceRoot
@@ -838,16 +883,19 @@ async function handleTask(argv) {
       ({ payload } = enqueueBackgroundTask(cwd, jobWithWorktree, request));
     } catch (error) {
       // ponytail: guards only the pre-persist window — once enqueueBackgroundTask
-      // writes the job record, session-end cleanup owns the worktree. No-ops
-      // when no worktree was created (removeWorktree is a no-op without a path).
-      removeWorktree(cwd, worktreePath);
+      // writes the job record, session-end cleanup owns the worktree. Only clean
+      // up a worktree WE created here; one we're merely resuming into (tagged
+      // above) is owned by whoever created it and must not be torn down on an
+      // unrelated error. No-op when we didn't create one (removeWorktree is a
+      // no-op without a path).
+      removeWorktree(cwd, createdWorktreePath);
       throw error;
     }
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const foregroundJob = worktreePath ? { ...job, worktreePath } : job;
+  const foregroundJob = worktreePath ? { ...job, worktreePath, ...(worktreeBase ? { worktreeBase } : {}) } : job;
   await runForegroundCommand(
     foregroundJob,
     (progress) =>
@@ -1031,8 +1079,10 @@ function handleApply(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  const storedJob = readStoredJob(workspaceRoot, job.id) ?? {};
-  const worktreePath = job.worktreePath ?? storedJob.worktreePath ?? null;
+  // Every write path that creates or resumes into a worktree tags it on the
+  // index record (job.worktreePath) — no need to fall back to the stored
+  // job file.
+  const worktreePath = job.worktreePath ?? null;
   if (!worktreePath) {
     throw new Error(`Job ${job.id} has no worktree — it ran directly in the main tree, nothing to apply.`);
   }
@@ -1040,7 +1090,15 @@ function handleApply(argv) {
     throw new Error(`Worktree for ${job.id} is gone (${worktreePath}). Nothing to apply.`);
   }
 
-  const { applied, files } = applyWorktreeDiff(cwd, worktreePath);
+  // worktreeBase lives on whichever job CREATED the worktree — if the caller
+  // asked to apply a job that only resumed into it (no --worktree flag), fall
+  // back to a sibling job sharing the same worktreePath.
+  const worktreeBase =
+    job.worktreeBase ??
+    listJobs(workspaceRoot).find((candidate) => candidate.worktreePath === worktreePath && candidate.worktreeBase)
+      ?.worktreeBase ??
+    "HEAD";
+  const { applied, files } = applyWorktreeDiff(cwd, worktreePath, worktreeBase);
   const payload = { jobId: job.id, worktreePath, applied, files };
   const rendered = applied
     ? `Applied ${files.length} file(s) from ${job.id}:\n${files.map((file) => `  ${file}`).join("\n")}\n`

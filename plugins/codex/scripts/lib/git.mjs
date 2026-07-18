@@ -106,6 +106,10 @@ export function getMainRepoRoot(cwd) {
   return path.dirname(commonDir);
 }
 
+export function resolveCommitSha(cwd, ref) {
+  return gitChecked(cwd, ["rev-parse", ref]).stdout.trim();
+}
+
 export function createTaskWorktree(cwd, worktreePath, baseRef = "HEAD") {
   const repoRoot = getRepoRoot(cwd);
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
@@ -124,19 +128,22 @@ export function removeWorktree(cwd, worktreePath) {
   git(repoRoot, ["worktree", "prune"]);
 }
 
-// Copy a worker worktree's uncommitted changes onto the main working tree.
+// Copy a worker worktree's changes onto the main working tree — committed or
+// not. Diffing against the worktree's ORIGINAL base commit (not HEAD) means a
+// worker that ran `git commit` is still captured; diffing HEAD would show
+// nothing once the worker has committed on top of it.
 // All-or-nothing: `git apply --check` runs first, so a conflicting patch
 // changes nothing and the coordinator merges manually instead.
-export function applyWorktreeDiff(cwd, worktreePath) {
+export function applyWorktreeDiff(cwd, worktreePath, baseRef = "HEAD") {
   const repoRoot = getRepoRoot(cwd);
   // Track brand-new files so the diff includes them (content stays unstaged).
   gitChecked(worktreePath, ["add", "--intent-to-add", "--all"]);
-  const diffArgs = ["diff", "--binary", "--no-ext-diff", "HEAD"];
+  const diffArgs = ["diff", "--binary", "--no-ext-diff", baseRef];
   const diff = gitChecked(worktreePath, diffArgs, { maxBuffer: 64 * 1024 * 1024 }).stdout;
   if (!diff.trim()) {
     return { applied: false, files: [] };
   }
-  const files = gitChecked(worktreePath, ["diff", "--name-only", "HEAD"]).stdout.trim().split("\n").filter(Boolean);
+  const files = gitChecked(worktreePath, ["diff", "--name-only", baseRef]).stdout.trim().split("\n").filter(Boolean);
 
   const check = git(repoRoot, ["apply", "--check", "--binary"], { input: diff });
   if (check.status !== 0) {

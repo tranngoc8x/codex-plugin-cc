@@ -10,6 +10,7 @@ import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { listJobs, resolveRuntimeStateDir, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { createTaskWorktree } from "../plugins/codex/scripts/lib/git.mjs";
+import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -28,6 +29,38 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   }
   throw new Error("Timed out waiting for condition.");
 }
+
+test("a NEEDS_INPUT escalation is stamped on the job record at store time", async () => {
+  const repo = makeTempDir();
+  const execution = {
+    exitStatus: 0,
+    threadId: "thr_escalated",
+    turnId: "turn_1",
+    payload: { rawOutput: "NEEDS_INPUT: which database port?" },
+    rendered: "NEEDS_INPUT: which database port?\n",
+    summary: "Escalated"
+  };
+  await runTrackedJob({ id: "job-escalated", workspaceRoot: repo }, () => execution);
+
+  const [job] = listJobs(repo);
+  assert.equal(job.needsInput, true, "wait --json / status --json must be able to see the escalation without re-parsing rawOutput");
+});
+
+test("an ordinary completion does not set needsInput", async () => {
+  const repo = makeTempDir();
+  const execution = {
+    exitStatus: 0,
+    threadId: "thr_ok",
+    turnId: "turn_1",
+    payload: { rawOutput: "Done. Refactored the module." },
+    rendered: "Done. Refactored the module.\n",
+    summary: "Done"
+  };
+  await runTrackedJob({ id: "job-ok", workspaceRoot: repo }, () => execution);
+
+  const [job] = listJobs(repo);
+  assert.equal(job.needsInput, false);
+});
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
@@ -615,7 +648,126 @@ test("job index is shared between the main repo and its worktrees", () => {
   assert.notEqual(resolveRuntimeStateDir(worktree), resolveRuntimeStateDir(repo));
 });
 
-function seedFinishedWorktreeJob(repo, worktreePath) {
+test("task --resume-last is not blocked by a sibling worker on a different thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const myThreadId = JSON.parse(firstRun.stdout).threadId;
+  assert.ok(myThreadId);
+
+  // Inject a fan-out sibling still running on a DIFFERENT thread, same
+  // session — the shared job index now makes it visible, but it must not
+  // block resuming this session's own finished task.
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs.push({
+    id: "task-sibling-running",
+    status: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-current",
+    threadId: "thr_sibling",
+    summary: "Sibling worker still running",
+    updatedAt: new Date().toISOString()
+  });
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--json", "continue"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).threadId, myThreadId);
+});
+
+test("task --resume-last still refuses a thread another session is running on", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const myThreadId = JSON.parse(firstRun.stdout).threadId;
+  assert.ok(myThreadId);
+
+  // Another Claude session already resumed this exact thread (e.g. via
+  // --thread) and is still running on it.
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs.push({
+    id: "task-other-session-running",
+    status: "running",
+    title: "Codex Resume",
+    jobClass: "task",
+    sessionId: "sess-other",
+    threadId: myThreadId,
+    summary: "Another session resumed this thread",
+    updatedAt: new Date().toISOString()
+  });
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "continue"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is still running on this thread/);
+});
+
+test("task --thread stamps its claim atomically, closing the race between two concurrent resumes", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const threadId = JSON.parse(firstRun.stdout).threadId;
+  assert.ok(threadId);
+
+  // Launch two background resumes on the same thread back-to-back. Without an
+  // atomic check-and-claim, both workers' busy-check could see threadId still
+  // unset on each other's in-flight job record and both would pass.
+  const launchA = run("node", [SCRIPT, "task", "--background", "--json", "--thread", threadId, "answer A"], { cwd: repo, env });
+  const launchB = run("node", [SCRIPT, "task", "--background", "--json", "--thread", threadId, "answer B"], { cwd: repo, env });
+  assert.equal(launchA.status, 0, launchA.stderr);
+  assert.equal(launchB.status, 0, launchB.stderr);
+  const jobIdA = JSON.parse(launchA.stdout).jobId;
+  const jobIdB = JSON.parse(launchB.stdout).jobId;
+
+  const finished = await waitFor(() => {
+    const jobs = listJobs(repo);
+    const jobA = jobs.find((job) => job.id === jobIdA);
+    const jobB = jobs.find((job) => job.id === jobIdB);
+    const isTerminal = (job) => job && job.status !== "queued" && job.status !== "running";
+    if (isTerminal(jobA) && isTerminal(jobB)) {
+      return { jobA, jobB };
+    }
+    return null;
+  }, { timeoutMs: 15000 });
+
+  const outcomes = [finished.jobA, finished.jobB];
+  const succeeded = outcomes.filter((job) => job.status === "completed");
+  const rejected = outcomes.filter((job) => job.status === "failed");
+  assert.equal(succeeded.length, 1, `expected exactly one winner, got: ${JSON.stringify(outcomes)}`);
+  assert.equal(rejected.length, 1, `expected exactly one loser, got: ${JSON.stringify(outcomes)}`);
+  assert.match(rejected[0].errorMessage ?? "", /is still running on this thread/);
+});
+
+function seedFinishedWorktreeJob(repo, worktreePath, worktreeBase = null) {
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   fs.writeFileSync(
@@ -632,6 +784,7 @@ function seedFinishedWorktreeJob(repo, worktreePath) {
             jobClass: "task",
             threadId: "thr_wt",
             worktreePath,
+            ...(worktreeBase ? { worktreeBase } : {}),
             summary: "Worker finished",
             updatedAt: "2026-03-24T20:05:00.000Z"
           }
@@ -698,6 +851,38 @@ test("apply refuses a worker diff that does not apply cleanly", () => {
   // All-or-nothing: the conflicting patch must not half-land.
   assert.equal(fs.readFileSync(path.join(repo, "README.md"), "utf8"), "diverged locally\n");
   assert.ok(!fs.existsSync(path.join(repo, "notes.txt")));
+});
+
+test("apply still captures a worker's changes after the worker committed them", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const baseSha = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+
+  const worktree = path.join(makeTempDir(), "wt");
+  run("git", ["worktree", "add", "--detach", worktree], { cwd: repo });
+  // Worker committed its own work instead of leaving it uncommitted — HEAD
+  // inside the worktree has moved past worktreeBase, so a diff against HEAD
+  // would show nothing.
+  fs.writeFileSync(path.join(worktree, "notes.txt"), "committed by worker\n");
+  run("git", ["add", "notes.txt"], { cwd: worktree });
+  run("git", ["commit", "-m", "worker commit"], { cwd: worktree });
+
+  seedFinishedWorktreeJob(repo, worktree, baseSha);
+
+  const result = run("node", [SCRIPT, "apply", "task-wt", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.applied, true);
+  assert.deepEqual(payload.files, ["notes.txt"]);
+  assert.equal(fs.readFileSync(path.join(repo, "notes.txt"), "utf8"), "committed by worker\n");
 });
 
 test("task --thread conflicts with --resume-last and --fresh", () => {
@@ -1236,6 +1421,90 @@ test("task --worktree runs Codex in an isolated worktree and records its path", 
   // (git resolves symlinks, e.g. macOS /tmp -> /private/tmp, so compare realpaths.)
   const fakeCodexState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fs.realpathSync(fakeCodexState.threads[0].cwd), fs.realpathSync(worktreePath));
+});
+
+test("task --cwd into an existing worktree tags worktreePath even without --worktree", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launch = run("node", [SCRIPT, "task", "--worktree", "--json", "initial worker task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobA = listJobs(repo).find((job) => job.jobClass === "task");
+  assert.ok(jobA?.worktreePath && fs.existsSync(jobA.worktreePath));
+  const worktreePath = jobA.worktreePath;
+  const threadId = jobA.threadId;
+  assert.ok(threadId);
+
+  // Answering an escalation resumes the worker via --cwd <worktreePath>
+  // --thread <id>, with no --worktree flag — this job didn't CREATE the
+  // worktree, but it IS operating in it, and cleanup needs to know that.
+  const resume = run("node", [SCRIPT, "task", "--cwd", worktreePath, "--thread", threadId, "--json", "the answer"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(resume.status, 0, resume.stderr);
+  const jobB = listJobs(repo).find((job) => job.id !== jobA.id && job.jobClass === "task");
+  // git resolves symlinks (e.g. macOS /tmp -> /private/tmp), so compare realpaths.
+  assert.equal(fs.realpathSync(jobB.worktreePath), fs.realpathSync(worktreePath));
+});
+
+test("session end does not remove a worktree another session's live job is still using", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const worktreePath = path.join(resolveStateDir(repo), "worktrees", "job-wt");
+  createTaskWorktree(repo, worktreePath, "HEAD");
+  assert.ok(fs.existsSync(worktreePath), "worktree should exist before session end");
+
+  // Launcher's own (finished) job in the ending session.
+  upsertJob(repo, {
+    id: "job-wt",
+    status: "completed",
+    jobClass: "task",
+    sessionId: "sess-current",
+    worktreePath
+  });
+  // A different session resumed a worker inside that same worktree and is
+  // still running there (e.g. via task --cwd <worktreePath> --thread <id>).
+  upsertJob(repo, {
+    id: "job-wt-resume",
+    status: "running",
+    jobClass: "task",
+    sessionId: "sess-other",
+    worktreePath
+  });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(fs.existsSync(worktreePath), "worktree must survive while another session's job is still using it");
+  // The launcher's own finished job is still removed as usual — only the
+  // worktree itself is protected, not the job-index bookkeeping.
+  const remaining = listJobs(repo);
+  assert.ok(!remaining.some((job) => job.id === "job-wt"));
+  assert.ok(remaining.some((job) => job.id === "job-wt-resume"));
 });
 
 test("task --worktree --background runs the queued job inside the worktree", async () => {

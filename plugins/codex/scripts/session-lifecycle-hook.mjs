@@ -59,8 +59,18 @@ function cleanupSessionJobs(cwd, sessionId) {
   const worktreePaths = [];
   updateState(workspaceRoot, (state) => {
     const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    const remainingJobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+    // A worktree can be shared across sessions (a worker escalation answered
+    // from a different Claude session via --cwd <worktreePath> --thread
+    // <id>) — don't remove it out from under a still-live job from ANY
+    // session, not just this one.
+    const liveWorktreePaths = new Set(
+      remainingJobs
+        .filter((job) => job.worktreePath && (job.status === "queued" || job.status === "running"))
+        .map((job) => job.worktreePath)
+    );
     for (const job of removedJobs) {
-      if (job.worktreePath) {
+      if (job.worktreePath && !liveWorktreePaths.has(job.worktreePath)) {
         worktreePaths.push(job.worktreePath);
       }
       const stillRunning = job.status === "queued" || job.status === "running";
@@ -73,7 +83,7 @@ function cleanupSessionJobs(cwd, sessionId) {
         // Ignore teardown failures during session shutdown.
       }
     }
-    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+    state.jobs = remainingJobs;
   });
 
   for (const worktreePath of worktreePaths) {

@@ -60,13 +60,17 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
 
 test("renderStoredJobResult flags a NEEDS_INPUT escalation with a banner", () => {
   const output = renderStoredJobResult(
-    { id: "task-1", status: "completed", title: "Codex Task", jobClass: "task", threadId: "thr_1" },
+    { id: "task-1", status: "completed", title: "Codex Task", jobClass: "task", threadId: "thr_1", worktreePath: "/tmp/wt-1" },
     { threadId: "thr_1", result: { rawOutput: "NEEDS_INPUT: which database port?" } }
   );
   assert.match(output, /NEEDS INPUT: which database port\?/);
-  // The banner must teach the working resume flow: --thread with the real id.
+  // The banner must teach the working resume flow: --thread with the real id
+  // and --cwd with the real worktree path — not placeholders the user has to
+  // fill in themselves when the system already knows the answer.
+  assert.match(output, /--cwd \/tmp\/wt-1/);
   assert.match(output, /--thread thr_1/);
   assert.doesNotMatch(output, /--resume-last/);
+  assert.doesNotMatch(output, /<worktreePath>/);
 });
 
 test("renderStoredJobResult does not add a banner for ordinary output", () => {

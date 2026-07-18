@@ -2,6 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { extractRawOutput, isEscalatedRawOutput } from "./render.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -155,6 +156,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    // Stamped once here so JSON consumers (wait --json, status --json) can
+    // see an escalation without re-parsing rawOutput themselves.
+    const needsInput = isEscalatedRawOutput(extractRawOutput(execution.payload));
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
@@ -163,6 +167,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
+      needsInput,
       result: execution.payload,
       rendered: execution.rendered
     });
@@ -174,6 +179,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
+      needsInput,
       completedAt
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
